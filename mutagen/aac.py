@@ -45,6 +45,13 @@ class _ADTSStream(object):
 
         r = BitReader(fileobj)
         stream = cls(r)
+        # remember where the data ends, so that frames reaching past it
+        # can be detected as truncated (BitReader.skip() alone wouldn't
+        # notice since it seeks without reading)
+        pos = fileobj.tell()
+        fileobj.seek(0, 2)
+        stream._end_bits = (fileobj.tell() - pos) * 8
+        fileobj.seek(pos)
         if stream.sync(max_bytes):
             stream.offset = (r.get_position() - 12) // 8
             return stream
@@ -85,6 +92,19 @@ class _ADTSStream(object):
         self._start = r.get_position() / 8
         self._last = self._start
 
+        # channel count from a program_config_element(), in case the
+        # fixed header carries no channel configuration (None = not
+        # looked for yet)
+        self._pce_channels = None
+        # set if a program_config_element() was found but couldn't be
+        # parsed because the stream ended in the middle of it
+        self._pce_error = None
+        # set if the stream ended in the middle of a frame
+        self._truncated = False
+        # bit position (relative to the reader) at which the data ends,
+        # or None if unknown
+        self._end_bits = None
+
     @property
     def bitrate(self):
         """Bitrate of the raw aac blocks, excluding framing/crc"""
@@ -119,7 +139,11 @@ class _ADTSStream(object):
         assert self.parsed_frames, "no frame parsed yet"
 
         b_index = self._fixed_header_key[6]
-        if b_index == 7:
+        if b_index == 0:
+            # the channel configuration is carried in a
+            # program_config_element() in the stream instead
+            return self._pce_channels or 0
+        elif b_index == 7:
             return 8
         elif b_index > 7:
             return 0
@@ -146,6 +170,8 @@ class _ADTSStream(object):
         try:
             return self._parse_frame()
         except BitReaderError:
+            # the stream ended in the middle of a frame
+            self._truncated = True
             return False
 
     def _parse_frame(self):
@@ -161,7 +187,6 @@ class _ADTSStream(object):
         profile = r.bits(2)
         sampling_frequency_index = r.bits(4)
         private_bit = r.bits(1)
-        # TODO: if 0 we could parse program_config_element()
         channel_configuration = r.bits(3)
         original_copy = r.bits(1)
         home = r.bits(1)
@@ -187,14 +212,41 @@ class _ADTSStream(object):
 
         crc_overhead = 0
         if not protection_absent:
-            crc_overhead += (nordbif + 1) * 16
+            # one crc_check after the header, and if there are multiple
+            # raw data blocks one crc_check after each of them
+            crc_overhead = (nordbif + 1) * 16
             if nordbif != 0:
-                crc_overhead *= 2
+                crc_overhead += 16
 
         left = (frame_length * 8) - (r.get_position() - start)
         if left < 0:
             return False
-        r.skip(left)
+        frame_end = r.get_position() + left
+        if self._end_bits is not None and frame_end > self._end_bits:
+            # the frame reaches past the end of the stream
+            self._truncated = True
+            return False
+
+        if channel_configuration == 0 and self._pce_channels is None:
+            # With channel_configuration == 0 the channel setup is
+            # described by a program_config_element() at the start of
+            # the first raw_data_block().
+            self._pce_channels = 0
+            if not protection_absent:
+                r.skip(16)  # crc_check
+            if r.bits(3) == 0x5:  # ID_PCE
+                try:
+                    pce = ProgramConfigElement(r)
+                except BitReaderError as e:
+                    # stream ended in the middle of the PCE
+                    self._pce_error = e
+                    return False
+                self._pce_channels = pce.channels
+            if r.get_position() > frame_end:
+                # the PCE doesn't fit into the frame
+                return False
+
+        r.skip(frame_end - r.get_position())
         assert r.is_aligned()
 
         self._payload += (left - crc_overhead) / 8
@@ -345,11 +397,16 @@ class AACInfo(StreamInfo):
         # Try up to X times to find a sync word and read up to Y frames.
         # If more than Z frames are valid we assume a valid stream
         offset = start_offset
+        pce_error = None
+        truncated = False
+        parsed_frames = 0
         for i in range(max_sync_tries):
             fileobj.seek(offset)
             s = _ADTSStream.find_stream(fileobj, max_initial_read)
             if s is None:
-                raise AACError("sync not found")
+                if i == 0:
+                    raise AACError("sync not found")
+                break
             # start right after the last found offset
             offset += s.offset + 1
 
@@ -361,9 +418,22 @@ class AACInfo(StreamInfo):
 
             if s.parsed_frames >= frames_needed:
                 break
+
+            parsed_frames = max(parsed_frames, s.parsed_frames)
+            if s._pce_error is not None:
+                pce_error = s._pce_error
+            truncated = truncated or s._truncated
         else:
+            s = None
+
+        if s is None or s.parsed_frames < frames_needed:
+            if pce_error is not None:
+                raise AACError(
+                    "truncated program_config_element: %s" % pce_error)
+            if truncated:
+                raise AACError("stream truncated")
             raise AACError(
-                "no valid stream found (only %d frames)" % s.parsed_frames)
+                "no valid stream found (only %d frames)" % parsed_frames)
 
         self.sample_rate = s.frequency
         self.channels = s.channels
