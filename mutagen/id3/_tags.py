@@ -15,7 +15,8 @@ from mutagen._util import DictProxy, convert_error, read_full
 
 from ._util import BitPaddedInt, unsynch, ID3JunkFrameError, \
     ID3EncryptionUnsupportedError, is_valid_frame_id, error, \
-    ID3NoHeaderError, ID3UnsupportedVersionError, ID3SaveConfig
+    ID3NoHeaderError, ID3UnsupportedVersionError, ID3SaveConfig, \
+    ID3FrameEncodingError
 from ._frames import TDRC, APIC, TDOR, TIME, TIPL, TORY, TDAT, Frames_2_2, \
     TextFrame, TYER, Frame, IPLS, Frames
 
@@ -171,12 +172,14 @@ class ID3Tags(DictProxy, Tags):
 
     def __init__(self, *args, **kwargs):
         self.unknown_frames = []
+        self.load_errors = []
         self._unknown_v2_version = 4
         super(ID3Tags, self).__init__(*args, **kwargs)
 
     def _read(self, header, data):
+        self.load_errors = []
         frames, unknown_frames, data = read_frames(
-            header, data, header.known_frames)
+            header, data, header.known_frames, self.load_errors)
         for frame in frames:
             self._add(frame, False)
         self.unknown_frames = unknown_frames
@@ -553,8 +556,25 @@ def save_frame(frame, name=None, config=None):
     return header + framedata
 
 
-def read_frames(id3, data, frames):
-    """Does not error out"""
+def read_frames(id3, data, frames, errors=None):
+    """Does not error out
+
+    Args:
+        id3 (ID3Header): the tag header
+        data (bytes): the tag's frame data
+        frames (dict): mapping of frame IDs to `Frame` classes
+        errors (list or None): if a list is passed, frames that fail to
+            parse are skipped (as before) and an `ID3JunkFrameError`
+            subclass instance describing the failure is appended to it.
+            The exception's type classifies the error (e.g.
+            `ID3FrameSizeError` for truncated/undersized frame data,
+            `ID3FrameEncodingError` for undecodable text) and its
+            `frame_id`/`offset` attributes locate the broken frame.
+            Offsets are relative to the start of `data`.
+
+    Returns:
+        (frames, unsupported_frames, leftover_data)
+    """
 
     assert id3.version >= ID3Header._V22
 
@@ -573,6 +593,7 @@ def read_frames(id3, data, frames):
         else:
             bpi = determine_bpi(data, frames)
 
+        offset = 0
         while data:
             header = data[:10]
             try:
@@ -585,12 +606,18 @@ def read_frames(id3, data, frames):
             size = bpi(size)
             framedata = data[10:10 + size]
             data = data[10 + size:]
+            frame_offset = offset
+            offset += 10 + size
             if size == 0:
                 continue  # drop empty frames
 
             try:
                 name = name.decode('ascii')
             except UnicodeDecodeError:
+                if errors is not None:
+                    errors.append(ID3FrameEncodingError(
+                        "frame ID is not ASCII: %r" % (name,),
+                        offset=frame_offset))
                 continue
 
             try:
@@ -608,9 +635,13 @@ def read_frames(id3, data, frames):
                     result.append(tag._fromData(id3, flags, framedata))
                 except NotImplementedError:
                     unsupported_frames.append(header + framedata)
-                except ID3JunkFrameError:
-                    pass
+                except ID3JunkFrameError as e:
+                    if errors is not None:
+                        e.frame_id = name
+                        e.offset = frame_offset
+                        errors.append(e)
     elif id3.version >= ID3Header._V22:
+        offset = 0
         while data:
             header = data[0:6]
             try:
@@ -623,12 +654,18 @@ def read_frames(id3, data, frames):
 
             framedata = data[6:6 + size]
             data = data[6 + size:]
+            frame_offset = offset
+            offset += 6 + size
             if size == 0:
                 continue  # drop empty frames
 
             try:
                 name = name.decode('ascii')
             except UnicodeDecodeError:
+                if errors is not None:
+                    errors.append(ID3FrameEncodingError(
+                        "frame ID is not ASCII: %r" % (name,),
+                        offset=frame_offset))
                 continue
 
             try:
@@ -643,7 +680,10 @@ def read_frames(id3, data, frames):
                 except (ID3EncryptionUnsupportedError,
                         NotImplementedError):
                     unsupported_frames.append(header + framedata)
-                except ID3JunkFrameError:
-                    pass
+                except ID3JunkFrameError as e:
+                    if errors is not None:
+                        e.frame_id = name
+                        e.offset = frame_offset
+                        errors.append(e)
 
     return result, unsupported_frames, data

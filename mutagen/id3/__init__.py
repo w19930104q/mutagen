@@ -38,7 +38,10 @@ from ._frames import Frames, Frames_2_2 as Frames_2_2, Frame as Frame, \
     NumericPartTextFrame as NumericPartTextFrame, \
     NumericTextFrame as NumericTextFrame, PairedTextFrame as PairedTextFrame
 from ._util import ID3NoHeaderError as ID3NoHeaderError, error as error, \
-    ID3UnsupportedVersionError as ID3UnsupportedVersionError
+    ID3UnsupportedVersionError as ID3UnsupportedVersionError, \
+    ID3FrameSizeError as ID3FrameSizeError, \
+    ID3FrameEncodingError as ID3FrameEncodingError, \
+    ID3FrameCompressionError as ID3FrameCompressionError
 from ._id3v1 import ParseID3v1 as ParseID3v1, MakeID3v1 as MakeID3v1
 from ._tags import ID3Tags as ID3Tags
 from ._frames import AENC as AENC, APIC as APIC, ASPI as ASPI, BUF as BUF, \

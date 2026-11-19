@@ -1,12 +1,14 @@
 
 import operator
+import struct
 
 from tests import TestCase
 
 from mutagen._constants import GENRES
 from mutagen.id3._tags import read_frames, save_frame, ID3Header
 from mutagen.id3._util import ID3SaveConfig, is_valid_frame_id, \
-    ID3JunkFrameError
+    ID3JunkFrameError, ID3FrameSizeError, ID3FrameEncodingError, \
+    ID3FrameCompressionError
 from mutagen.id3 import APIC, CTOC, CHAP, TPE2, Frames, Frames_2_2, CRA, \
     AENC, PIC, LNK, LINK, SIGN, PRIV, GRID, ENCR, COMR, USER, UFID, GEOB, \
     POPM, EQU2, RVA2, COMM, SYLT, USLT, WXXX, TXXX, WCOM, TextFrame, \
@@ -1154,6 +1156,94 @@ class Tread_frames_load_frame(TestCase):
         tag = read_frames(_24, save_frame(artist, config=config), Frames)[0][0]
         self.assertEquals('TPE1', type(tag).__name__)
         self.assertEquals(artist.text, tag.text)
+
+
+class Tread_frames_errors(TestCase):
+
+    @staticmethod
+    def _frame(fid, payload, flags=0):
+        return fid + struct.pack('>LH', len(payload), flags) + payload
+
+    def test_no_errors_for_valid_frames(self):
+        errors = []
+        data = self._frame(b'TPE1', b'\x03hello')
+        tags = read_frames(_24, data, Frames, errors)[0]
+        self.assertEquals(1, len(tags))
+        self.assertEquals([], errors)
+
+    def test_no_errors_collected_by_default(self):
+        # errors argument optional, broken frames still silently dropped
+        data = self._frame(b'TIT2', b'\x42junk')
+        self.assertEquals([], read_frames(_24, data, Frames)[0])
+
+    def test_encoding_error_classification(self):
+        errors = []
+        # invalid encoding byte 0x42
+        data = self._frame(b'TIT2', b'\x42junk')
+        self.assertEquals([], read_frames(_24, data, Frames, errors)[0])
+        self.assertEquals(1, len(errors))
+        self.assertIsInstance(errors[0], ID3FrameEncodingError)
+        self.assertIsInstance(errors[0], ID3JunkFrameError)
+        self.assertEquals('TIT2', errors[0].frame_id)
+        self.assertEquals(0, errors[0].offset)
+        self.assertIn('TIT2', str(errors[0]))
+        self.assertIn('0', str(errors[0]))
+
+    def test_size_error_classification(self):
+        errors = []
+        # RVA2 needs at least channel + gain after the description
+        data = self._frame(b'RVA2', b'\x00\x01')
+        self.assertEquals([], read_frames(_24, data, Frames, errors)[0])
+        self.assertEquals(1, len(errors))
+        self.assertIsInstance(errors[0], ID3FrameSizeError)
+        self.assertEquals('RVA2', errors[0].frame_id)
+
+    def test_compression_error_classification(self):
+        errors = []
+        # FLAG24_COMPRESS | FLAG24_DATALEN with garbage zlib data
+        data = self._frame(b'TPE2', b'\x00\x00\x00\x05notzlib',
+                           flags=Frame.FLAG24_COMPRESS | Frame.FLAG24_DATALEN)
+        self.assertEquals([], read_frames(_24, data, Frames, errors)[0])
+        self.assertEquals(1, len(errors))
+        self.assertIsInstance(errors[0], ID3FrameCompressionError)
+        self.assertEquals('TPE2', errors[0].frame_id)
+
+    def test_offset_of_second_frame(self):
+        errors = []
+        good = self._frame(b'TPE1', b'\x03hello')
+        bad = self._frame(b'TIT2', b'\x42junk')
+        tags = read_frames(_24, good + bad, Frames, errors)[0]
+        self.assertEquals(1, len(tags))
+        self.assertEquals(1, len(errors))
+        self.assertEquals('TIT2', errors[0].frame_id)
+        self.assertEquals(len(good), errors[0].offset)
+
+    def test_broken_frame_id_reports_offset(self):
+        errors = []
+        data = b'\xff\xfe A' + b'\x00\x00\x00\x03\x00\x00' + b'abc'
+        self.assertEquals([], read_frames(_24, data, Frames, errors)[0])
+        self.assertEquals(1, len(errors))
+        self.assertIsInstance(errors[0], ID3FrameEncodingError)
+        self.assertEquals(None, errors[0].frame_id)
+        self.assertEquals(0, errors[0].offset)
+
+    def test_errors_v23(self):
+        errors = []
+        data = self._frame(b'TIT2', b'\x42junk')
+        self.assertEquals([], read_frames(_23, data, Frames, errors)[0])
+        self.assertEquals(1, len(errors))
+        self.assertIsInstance(errors[0], ID3FrameEncodingError)
+        self.assertEquals('TIT2', errors[0].frame_id)
+
+    def test_errors_v22(self):
+        errors = []
+        data = b'TT2' + b'\x00\x00\x05' + b'\x42junk'
+        self.assertEquals(
+            [], read_frames(_22, data, Frames_2_2, errors)[0])
+        self.assertEquals(1, len(errors))
+        self.assertIsInstance(errors[0], ID3FrameEncodingError)
+        self.assertEquals('TT2', errors[0].frame_id)
+        self.assertEquals(0, errors[0].offset)
 
 
 class TTPE2(TestCase):

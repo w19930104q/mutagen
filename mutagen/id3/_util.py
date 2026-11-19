@@ -41,7 +41,54 @@ class ID3EncryptionUnsupportedError(error, NotImplementedError):
 
 
 class ID3JunkFrameError(error):
-    pass
+    """A single frame failed to parse and was skipped.
+
+    Attributes:
+        frame_id (str): The ID of the frame that failed to parse,
+            or `None` if it isn't known (e.g. the frame ID itself
+            was corrupted).
+        offset (int): The offset of the frame header, relative to the
+            start of the tag's frame data, or `None` if not known.
+
+    Both attributes are `None` for errors raised outside of tag parsing
+    (e.g. by calling `Frame._fromData` directly).
+    """
+
+    def __init__(self, msg="", frame_id=None, offset=None):
+        super(ID3JunkFrameError, self).__init__(msg)
+        self.frame_id = frame_id
+        self.offset = offset
+
+    def __str__(self):
+        msg = super(ID3JunkFrameError, self).__str__()
+        location = []
+        if self.frame_id is not None:
+            location.append("frame %r" % self.frame_id)
+        if self.offset is not None:
+            location.append("offset %d" % self.offset)
+        if location:
+            location = ", ".join(location)
+            if msg:
+                return "%s (%s)" % (msg, location)
+            return location
+        return msg
+
+
+class ID3FrameSizeError(ID3JunkFrameError):
+    """The frame data was truncated or smaller than the frame requires.
+
+    For example the declared frame size exceeds the remaining tag data,
+    or a fixed-size field doesn't fit into the frame.
+    """
+
+
+class ID3FrameEncodingError(ID3JunkFrameError):
+    """The frame contains an invalid encoding marker or text that
+    can't be decoded with the frame's encoding."""
+
+
+class ID3FrameCompressionError(ID3JunkFrameError):
+    """The compressed frame data could not be decompressed."""
 
 
 class unsynch(object):

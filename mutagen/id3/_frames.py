@@ -10,13 +10,15 @@ from struct import unpack
 from typing import Sequence
 
 from ._util import ID3JunkFrameError, ID3EncryptionUnsupportedError, unsynch, \
-    ID3SaveConfig, error
+    ID3SaveConfig, error, ID3FrameSizeError, ID3FrameEncodingError, \
+    ID3FrameCompressionError
 from ._specs import BinaryDataSpec, StringSpec, Latin1TextSpec, \
     EncodedTextSpec, ByteSpec, EncodingSpec, ASPIIndexSpec, SizedIntegerSpec, \
     IntegerSpec, Encoding, VolumeAdjustmentsSpec, VolumePeakSpec, \
     VolumeAdjustmentSpec, ChannelSpec, MultiSpec, SynchronizedTextSpec, \
     KeyEventSpec, TimeStampSpec, EncodedNumericPartTextSpec, \
-    EncodedNumericTextSpec, SpecError, PictureTypeSpec, ID3FramesSpec, \
+    EncodedNumericTextSpec, SpecError, SpecSizeError, SpecEncodingError, \
+    PictureTypeSpec, ID3FramesSpec, \
     Latin1TextListSpec, CTOCFlagsSpec, FrameIDSpec, RVASpec, Spec
 
 
@@ -175,16 +177,24 @@ class Frame(object):
             if len(data) or reader.handle_nodata:
                 try:
                     value, data = reader.read(id3, self, data)
+                except SpecSizeError as e:
+                    raise ID3FrameSizeError(e)
+                except SpecEncodingError as e:
+                    raise ID3FrameEncodingError(e)
                 except SpecError as e:
                     raise ID3JunkFrameError(e)
             else:
-                raise ID3JunkFrameError("no data left")
+                raise ID3FrameSizeError("no data left")
             self._setattr(reader.name, value)
 
         for reader in self._optionalspec:
             if len(data) or reader.handle_nodata:
                 try:
                     value, data = reader.read(id3, self, data)
+                except SpecSizeError as e:
+                    raise ID3FrameSizeError(e)
+                except SpecEncodingError as e:
+                    raise ID3FrameEncodingError(e)
                 except SpecError as e:
                     raise ID3JunkFrameError(e)
             else:
@@ -270,13 +280,13 @@ class Frame(object):
                     try:
                         data = zlib.decompress(data)
                     except zlib.error as err:
-                        raise ID3JunkFrameError(
+                        raise ID3FrameCompressionError(
                             'zlib: %s: %r' % (err, data))
 
         elif header.version >= header._V23:
             if tflags & Frame.FLAG23_COMPRESS:
                 if len(data) < 4:
-                    raise ID3JunkFrameError('frame too small: %r' % data)
+                    raise ID3FrameSizeError('frame too small: %r' % data)
                 usize, = unpack('>L', data[:4])
                 data = data[4:]
             if tflags & Frame.FLAG23_ENCRYPT:
@@ -285,7 +295,7 @@ class Frame(object):
                 try:
                     data = zlib.decompress(data)
                 except zlib.error as err:
-                    raise ID3JunkFrameError('zlib: %s: %r' % (err, data))
+                    raise ID3FrameCompressionError('zlib: %s: %r' % (err, data))
 
         frame = cls()
         frame._readData(header, data)

@@ -101,6 +101,14 @@ class SpecError(Exception):
     pass
 
 
+class SpecSizeError(SpecError):
+    """The remaining frame data is too small for the spec"""
+
+
+class SpecEncodingError(SpecError):
+    """The frame data can't be decoded with the frame's encoding"""
+
+
 class Spec(object):
 
     handle_nodata = False
@@ -252,7 +260,7 @@ class EncodingSpec(ByteSpec):
         enc, data = super(EncodingSpec, self).read(header, frame, data)
         if enc not in (Encoding.LATIN1, Encoding.UTF16, Encoding.UTF16BE,
                        Encoding.UTF8):
-            raise SpecError('Invalid Encoding: %r' % enc)
+            raise SpecEncodingError('Invalid Encoding: %r' % enc)
         return Encoding(enc), data
 
     def validate(self, frame, value):
@@ -284,7 +292,7 @@ class StringSpec(Spec):
         try:
             ascii = chunk.decode("ascii")
         except UnicodeDecodeError:
-            raise SpecError("not ascii")
+            raise SpecEncodingError("not ascii")
         else:
             chunk = ascii
 
@@ -321,7 +329,7 @@ class RVASpec(Spec):
         spec = ByteSpec("flags", 0)
         flags, data = spec.read(header, frame, data)
         if not data:
-            raise SpecError("truncated")
+            raise SpecSizeError("truncated")
 
         # how many bytes per value
         bits, data = spec.read(header, frame, data)
@@ -337,7 +345,7 @@ class RVASpec(Spec):
             values.append(v)
 
         if len(values) < 2:
-            raise SpecError("First two values not optional")
+            raise SpecSizeError("First two values not optional")
 
         # if the respective flag bit is zero, take as decrement
         for bit, index in enumerate([0, 1, 4, 5, 8, 10]):
@@ -476,7 +484,7 @@ class EncodedTextSpec(Spec):
                 if header.version < header._V24 and not data.strip(b"\x00"):
                     data = b""
                 return value, data
-        raise SpecError(err)
+        raise SpecEncodingError(err)
 
     def write(self, config, frame, value):
         enc, term = self._encodings[frame.encoding]
@@ -731,7 +739,10 @@ class ChannelSpec(ByteSpec):
 
 class VolumeAdjustmentSpec(Spec):
     def read(self, header, frame, data):
-        value, = unpack('>h', data[0:2])
+        try:
+            value, = unpack('>h', data[0:2])
+        except struct.error as e:
+            raise SpecSizeError(e)
         return value / 512.0, data[2:]
 
     def write(self, config, frame, value):
@@ -759,7 +770,7 @@ class VolumePeakSpec(Spec):
         vol_bytes = min(4, (bits + 7) >> 3)
         # not enough frame data
         if vol_bytes + 1 > len(data):
-            raise SpecError("not enough frame data")
+            raise SpecSizeError("not enough frame data")
         shift = ((8 - (bits & 7)) & 7) + (4 - vol_bytes) * 8
         for i in range(1, vol_bytes + 1):
             peak *= 256
@@ -792,10 +803,10 @@ class SynchronizedTextSpec(EncodedTextSpec):
             try:
                 value, data = decode_terminated(data, encoding)
             except ValueError:
-                raise SpecError("decoding error")
+                raise SpecEncodingError("decoding error")
 
             if len(data) < 4:
-                raise SpecError("not enough data")
+                raise SpecSizeError("not enough data")
             time, = struct.unpack(">I", data[:4])
 
             texts.append((value, time))
@@ -871,7 +882,7 @@ class ASPIIndexSpec(Spec):
         try:
             return list(struct.unpack(">" + format * frame.N, indexes)), data
         except struct.error as e:
-            raise SpecError(e)
+            raise SpecSizeError(e)
 
     def write(self, config, frame, values):
         if frame.b == 16:

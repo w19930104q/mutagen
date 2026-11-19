@@ -1,3 +1,17 @@
+.. _release-1.48.2:
+
+1.48.2 - unreleased
+-------------------
+
+* ID3: Add parse diagnostics for corrupted frames: ``ID3.load_errors``
+  (and the optional ``errors`` argument of ``read_frames``) collects one
+  error per broken frame, locating it by frame ID and offset
+  (``ID3JunkFrameError.frame_id`` / ``.offset``) and classifying it by
+  type: ``ID3FrameSizeError`` (truncated/undersized frame data),
+  ``ID3FrameEncodingError`` (invalid encoding marker or undecodable text)
+  and ``ID3FrameCompressionError`` (broken zlib data). Parsing behavior
+  is unchanged; broken frames are still skipped.
+
 .. _release-1.48.1:
 
 1.48.1 - 2026-06-25

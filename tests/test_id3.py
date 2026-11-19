@@ -473,6 +473,49 @@ class TID3Header(TestCase):
             b'ID3\x04B@\x00\x00\x00\x00\x00\x00\x00\x00')
         self.failUnlessRaises(ID3Error, ID3Header, fileobj)
 
+    def _tag_with_frames(self, frames_data, version=4):
+        header = b'ID3' + bytes([version, 0, 0]) + \
+            BitPaddedInt.to_str(len(frames_data), width=4)
+        return BytesIO(header + frames_data)
+
+    def test_load_errors_empty_for_valid_tag(self):
+        frame = b'TPE1\x00\x00\x00\x06\x00\x00\x03hello'
+        tag = ID3(self._tag_with_frames(frame))
+        self.assertEquals(['hello'], tag['TPE1'].text)
+        self.assertEquals([], tag.load_errors)
+
+    def test_load_errors_reports_frame_and_offset(self):
+        good = b'TPE1\x00\x00\x00\x06\x00\x00\x03hello'
+        # invalid encoding byte 0x42
+        bad = b'TIT2\x00\x00\x00\x05\x00\x00\x42junk'
+        tag = ID3(self._tag_with_frames(good + bad))
+        self.assertEquals(['hello'], tag['TPE1'].text)
+        self.assertEquals(1, len(tag.load_errors))
+        err = tag.load_errors[0]
+        self.assertIsInstance(err, id3.ID3FrameEncodingError)
+        self.assertEquals('TIT2', err.frame_id)
+        self.assertEquals(len(good), err.offset)
+        self.assertIn('TIT2', str(err))
+        self.assertIn(str(len(good)), str(err))
+
+    def test_load_errors_size_error(self):
+        # RVA2 needs at least channel + gain after the description
+        bad = b'RVA2\x00\x00\x00\x02\x00\x00\x00\x01'
+        tag = ID3(self._tag_with_frames(bad))
+        self.assertEquals(1, len(tag.load_errors))
+        err = tag.load_errors[0]
+        self.assertIsInstance(err, id3.ID3FrameSizeError)
+        self.assertEquals('RVA2', err.frame_id)
+        self.assertEquals(0, err.offset)
+
+    def test_load_errors_reset_on_load(self):
+        bad = b'TIT2\x00\x00\x00\x05\x00\x00\x42junk'
+        tag = ID3(self._tag_with_frames(bad))
+        self.assertEquals(1, len(tag.load_errors))
+        good = b'TPE1\x00\x00\x00\x06\x00\x00\x03hello'
+        tag.load(self._tag_with_frames(good))
+        self.assertEquals([], tag.load_errors)
+
     def test_23(self):
         id3 = ID3(self.silence)
         self.assertEqual(id3.version, (2, 3, 0))

@@ -56,6 +56,12 @@ class ID3(ID3Tags, mutagen.Metadata):
         version (tuple[int]): ID3 tag version as a tuple
         unknown_frames (list[bytes]): raw frame data of any unknown frames
             found
+        load_errors (list[ID3JunkFrameError]): errors for frames that
+            failed to parse during the last load. Each error is an instance
+            of an `ID3JunkFrameError` subclass classifying the failure
+            (`ID3FrameSizeError`, `ID3FrameEncodingError`,
+            `ID3FrameCompressionError`) and carries the frame ID and the
+            offset of the frame in its `frame_id` and `offset` attributes.
         size (int): the total size of the ID3 tag, including the header
     """
 
@@ -143,6 +149,7 @@ class ID3(ID3Tags, mutagen.Metadata):
             raise ValueError("Only 3 and 4 possible for v2_version")
 
         self.unknown_frames = []
+        self.load_errors = []
         self._header = None
         self._padding = 0
 
