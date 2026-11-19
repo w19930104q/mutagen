@@ -1,3 +1,10 @@
+1.49.0 - ????-??-??
+-------------------
+
+* MP4: Support editing and saving chapters (the ``moov.udta.chpl`` box)
+  via the mutable ``MP4.chapters`` list; changes are written on ``save()``
+  while tags, audio data and offset tables are preserved
+
 .. _release-1.48.1:
 
 1.48.1 - 2026-06-25

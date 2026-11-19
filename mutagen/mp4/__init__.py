@@ -25,7 +25,7 @@ were all consulted.
 import struct
 import sys
 from io import BytesIO
-from collections.abc import Sequence
+from collections.abc import MutableSequence
 from datetime import timedelta
 
 from mutagen import FileType, Tags, StreamInfo, PaddingInfo
@@ -418,17 +418,17 @@ class MP4Tags(DictProxy, Tags):
         except AtomError as err:
             reraise(error, err, sys.exc_info()[2])
 
-        self.__save(filething.fileobj, atoms, data, padding)
+        self._save(filething.fileobj, atoms, data, padding)
 
-    def __save(self, fileobj, atoms, data, padding):
+    def _save(self, fileobj, atoms, data, padding):
         try:
             path = atoms.path(b"moov", b"udta", b"meta", b"ilst")
         except KeyError:
-            self.__save_new(fileobj, atoms, data, padding)
+            self._save_new(fileobj, atoms, data, padding)
         else:
-            self.__save_existing(fileobj, atoms, path, data, padding)
+            self._save_existing(fileobj, atoms, path, data, padding)
 
-    def __save_new(self, fileobj, atoms, ilst_data, padding_func):
+    def _save_new(self, fileobj, atoms, ilst_data, padding_func):
         hdlr = Atom.render(b"hdlr", b"\x00" * 8 + b"mdirappl" + b"\x00" * 9)
         meta_data = b"\x00\x00\x00\x00" + hdlr + ilst_data
 
@@ -459,10 +459,10 @@ class MP4Tags(DictProxy, Tags):
         insert_bytes(fileobj, len(data), offset)
         fileobj.seek(offset)
         fileobj.write(data)
-        self.__update_parents(fileobj, path, len(data))
-        self.__update_offsets(fileobj, atoms, len(data), offset)
+        self._update_parents(fileobj, path, len(data))
+        self._update_offsets(fileobj, atoms, len(data), offset)
 
-    def __save_existing(self, fileobj, atoms, path, ilst_data, padding_func):
+    def _save_existing(self, fileobj, atoms, path, ilst_data, padding_func):
         # Replace the old ilst atom.
         ilst = path[-1]
         offset = ilst.offset
@@ -491,10 +491,10 @@ class MP4Tags(DictProxy, Tags):
 
         fileobj.seek(offset)
         fileobj.write(ilst_data)
-        self.__update_parents(fileobj, path[:-1], delta)
-        self.__update_offsets(fileobj, atoms, delta, offset)
+        self._update_parents(fileobj, path[:-1], delta)
+        self._update_offsets(fileobj, atoms, delta, offset)
 
-    def __update_parents(self, fileobj, path, delta):
+    def _update_parents(self, fileobj, path, delta):
         """Update all parent atoms with the new size."""
 
         if delta == 0:
@@ -512,7 +512,7 @@ class MP4Tags(DictProxy, Tags):
                 fileobj.seek(atom.offset)
                 fileobj.write(cdata.to_uint_be(size + delta))
 
-    def __update_offset_table(self, fileobj, fmt, atom, delta, offset):
+    def _update_offset_table(self, fileobj, fmt, atom, delta, offset):
         """Update offset table in the specified atom."""
         if atom.offset > offset:
             atom.offset += delta
@@ -527,7 +527,7 @@ class MP4Tags(DictProxy, Tags):
         except struct.error:
             raise MP4MetadataError("wrong offset inside %r" % atom.name)
 
-    def __update_tfhd(self, fileobj, atom, delta, offset):
+    def _update_tfhd(self, fileobj, atom, delta, offset):
         if atom.offset > offset:
             atom.offset += delta
         fileobj.seek(atom.offset + 9)
@@ -540,18 +540,18 @@ class MP4Tags(DictProxy, Tags):
             fileobj.seek(atom.offset + 16)
             fileobj.write(cdata.to_ulonglong_be(o))
 
-    def __update_offsets(self, fileobj, atoms, delta, offset):
+    def _update_offsets(self, fileobj, atoms, delta, offset):
         """Update offset tables in all 'stco' and 'co64' atoms."""
         if delta == 0:
             return
         moov = atoms[b"moov"]
         for atom in moov.findall(b'stco', True):
-            self.__update_offset_table(fileobj, ">%dI", atom, delta, offset)
+            self._update_offset_table(fileobj, ">%dI", atom, delta, offset)
         for atom in moov.findall(b'co64', True):
-            self.__update_offset_table(fileobj, ">%dQ", atom, delta, offset)
+            self._update_offset_table(fileobj, ">%dQ", atom, delta, offset)
         try:
             for atom in atoms[b"moof"].findall(b'tfhd', True):
-                self.__update_tfhd(fileobj, atom, delta, offset)
+                self._update_tfhd(fileobj, atom, delta, offset)
         except KeyError:
             pass
 
@@ -895,26 +895,47 @@ class MP4Tags(DictProxy, Tags):
 
 
 class Chapter(object):
-    """Chapter()
+    """Chapter(start, title)
 
     Chapter information container
+
+    Attributes:
+        start (`float`): position from the start of the file in seconds
+        title (`str`): title of the chapter
     """
     def __init__(self, start, title):
         self.start = start
         self.title = title
 
+    def __eq__(self, other):
+        if not isinstance(other, Chapter):
+            return NotImplemented
+        return (self.start == other.start and self.title == other.title)
 
-class MP4Chapters(Sequence):
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __repr__(self):
+        return "Chapter(%r, %r)" % (self.start, self.title)
+
+
+class MP4Chapters(MutableSequence):
     """MP4Chapters()
 
     MPEG-4 Chapter information.
 
     Supports the 'moov.udta.chpl' box.
 
-    A sequence of Chapter objects with the following members:
+    A mutable sequence of Chapter objects with the following members:
         start (`float`): position from the start of the file in seconds
         title (`str`): title of the chapter
 
+    Changes are written back to the file by `MP4.save`. To replace all
+    chapters at once assign a list of `Chapter` objects to
+    `MP4.chapters`; assign an empty list to remove every chapter.
     """
 
     def __init__(self, *args, **kwargs):
@@ -931,19 +952,46 @@ class MP4Chapters(Sequence):
     def __getitem__(self, key):
         return self._chapters.__getitem__(key)
 
+    def __setitem__(self, key, value):
+        if isinstance(key, slice):
+            value = [self._check_chapter(chapter) for chapter in value]
+        else:
+            value = self._check_chapter(value)
+        self._chapters.__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._chapters.__delitem__(key)
+
+    def insert(self, index, value):
+        self._chapters.insert(index, self._check_chapter(value))
+
+    @staticmethod
+    def _check_chapter(chapter):
+        if not isinstance(chapter, Chapter):
+            raise TypeError(
+                "chapter has to be a Chapter instance, not %r" %
+                type(chapter).__name__)
+        if not isinstance(chapter.title, str):
+            raise TypeError("chapter title has to be str")
+        if not isinstance(chapter.start, (int, float)):
+            raise TypeError("chapter start has to be a number")
+        if chapter.start < 0:
+            raise ValueError("chapter start can't be negative")
+        return chapter
+
     def load(self, atoms, fileobj):
         try:
-            mvhd = atoms.path(b"moov", b"mvhd")[-1]
-        except KeyError as key:
-            return MP4MetadataError(key)
+            mvhd = atoms[b"moov", b"mvhd"]
+        except KeyError:
+            # The timescale is only informational; the chpl timestamps are
+            # already stored in absolute 100 nanosecond units.
+            mvhd = None
 
-        self._parse_mvhd(mvhd, fileobj)
-
-        if not self._timescale:
-            raise MP4MetadataError("Unable to get timescale")
+        if mvhd is not None:
+            self._parse_mvhd(mvhd, fileobj)
 
         try:
-            chpl = atoms.path(b"moov", b"udta", b"chpl")[-1]
+            chpl = atoms[b"moov", b"udta", b"chpl"]
         except KeyError as key:
             return MP4MetadataError(key)
 
@@ -951,7 +999,7 @@ class MP4Chapters(Sequence):
 
     @classmethod
     def _can_load(cls, atoms):
-        return b"moov.udta.chpl" in atoms and b"moov.mvhd" in atoms
+        return b"moov.udta.chpl" in atoms
 
     def _parse_mvhd(self, atom, fileobj):
         assert atom.name == b"mvhd"
@@ -1004,6 +1052,75 @@ class MP4Chapters(Sequence):
             pos += title_len
 
             self._chapters.append(Chapter(start, title))
+
+    def _render(self):
+        """Render the chpl atom payload (without the atom header)."""
+
+        if len(self._chapters) > 0xFF:
+            raise MP4MetadataValueError(
+                "a chpl atom can hold at most 255 chapters")
+
+        # version 1, flags 0, followed by a 4 byte reserved field
+        data = b"\x01\x00\x00\x00" + b"\x00" * 4 + bchr(len(self._chapters))
+        for chapter in self._chapters:
+            title = chapter.title.encode("utf-8")
+            if len(title) > 0xFF:
+                raise MP4MetadataValueError(
+                    "chapter title can be at most 255 bytes long")
+            start = int(round(chapter.start * 10000000))
+            if start > 0xFFFFFFFFFFFFFFFF:
+                raise MP4MetadataValueError("chapter start is too large")
+            data += struct.pack(">Q", start) + bchr(len(title)) + title
+        return data
+
+    @convert_error(IOError, error)
+    def save(self, fileobj):
+        """Write the chapters into the 'moov.udta.chpl' atom of fileobj."""
+
+        chpl_data = Atom.render(b"chpl", self._render())
+
+        try:
+            atoms = Atoms(fileobj)
+        except AtomError as err:
+            reraise(error, err, sys.exc_info()[2])
+
+        tags = MP4Tags()
+        try:
+            chpl = atoms[b"moov", b"udta", b"chpl"]
+        except KeyError:
+            # No chpl atom yet: create one (and moov.udta if needed).
+            moov = atoms[b"moov"]
+            try:
+                udta = atoms[b"moov", b"udta"]
+            except KeyError:
+                data = Atom.render(
+                    b"udta", Atom.render(b"chpl", self._render()))
+                offset = moov._dataoffset
+                parents = [moov]
+            else:
+                # Append the new atom at the end of the udta payload,
+                # i.e. still inside the udta container, after its children.
+                data = chpl_data
+                offset = udta.offset + udta.length
+                parents = [moov, udta]
+
+            insert_bytes(fileobj, len(data), offset)
+            fileobj.seek(offset)
+            fileobj.write(data)
+            tags._update_parents(fileobj, parents, len(data))
+            tags._update_offsets(fileobj, atoms, len(data), offset)
+        else:
+            offset = chpl.offset
+            length = chpl.length
+
+            resize_bytes(fileobj, length, len(chpl_data), offset)
+            delta = len(chpl_data) - length
+
+            fileobj.seek(offset)
+            fileobj.write(chpl_data)
+            tags._update_parents(
+                fileobj, [atoms[b"moov"], atoms[b"moov", b"udta"]], delta)
+            tags._update_offsets(fileobj, atoms, delta, offset)
 
     def pprint(self):
         chapters = ["%s %s" % (timedelta(seconds=chapter.start), chapter.title)
@@ -1187,6 +1304,10 @@ class MP4(FileType):
     Attributes:
         info (`MP4Info`)
         tags (`MP4Tags`)
+        chapters (`MP4Chapters`): chapter list, or `None` if the file
+            contains no 'moov.udta.chpl' box. Assigning a list of
+            `Chapter` objects (or an empty list) replaces the chapters;
+            the changes are written on `save`.
     """
 
     MP4Tags = MP4Tags
@@ -1223,15 +1344,33 @@ class MP4(FileType):
             except Exception as err:
                 reraise(MP4MetadataError, err, sys.exc_info()[2])
 
-        if not MP4Chapters._can_load(atoms):
-            self.chapters = None
-        else:
+        self._chapters = None
+        if MP4Chapters._can_load(atoms):
             try:
-                self.chapters = self.MP4Chapters(atoms, fileobj)
+                self._chapters = self.MP4Chapters(atoms, fileobj)
             except error:
                 raise
             except Exception as err:
                 reraise(MP4MetadataError, err, sys.exc_info()[2])
+
+    @property
+    def chapters(self):
+        """`MP4Chapters`: chapters of the file, or `None` if there are none"""
+
+        return self._chapters
+
+    @chapters.setter
+    def chapters(self, chapters):
+        if chapters is None:
+            self._chapters = None
+        elif isinstance(chapters, MP4Chapters):
+            self._chapters = chapters
+        else:
+            new_chapters = self.MP4Chapters()
+            # MutableSequence.extend uses __len__/__getitem__ for size hints
+            # but falls back to iteration, which works on plain iterables.
+            new_chapters.extend(chapters)
+            self._chapters = new_chapters
 
     @property
     def _padding(self):
@@ -1240,10 +1379,16 @@ class MP4(FileType):
         else:
             return self.tags._padding
 
-    def save(self, *args, **kwargs):
+    @convert_error(IOError, error)
+    @loadfile(writable=True)
+    def save(self, filething=None, padding=None):
         """save(filething=None, padding=None)"""
 
-        super(MP4, self).save(*args, **kwargs)
+        if self.tags is not None:
+            self.tags.save(filething, padding=padding)
+
+        if self._chapters is not None:
+            self._chapters.save(filething.fileobj)
 
     def pprint(self):
         """

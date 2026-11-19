@@ -9,7 +9,8 @@ import pytest
 from tests import TestCase, DATA_DIR, get_temp_copy
 from mutagen.mp4 import (MP4, MP4Tags, MP4Info, delete, MP4Cover,
                          MP4MetadataError, MP4FreeForm, error, AtomDataType,
-                         _item_sort_key, MP4StreamInfoError)
+                         _item_sort_key, MP4StreamInfoError, Chapter,
+                         MP4Chapters)
 from mutagen.mp4._atom import Atom, Atoms, AtomError
 from mutagen.mp4._util import parse_full_atom
 from mutagen.mp4._as_entry import AudioSampleEntry, ASEntryError
@@ -1211,6 +1212,222 @@ class TMP4Chapters(TMP4):
         self.failUnlessEqual(len(chapters), 112)
         for i, c in enumerate(chapters):
             self.failUnlessEqual(c.title, str(i + 1).zfill(3))
+
+
+class TMP4ChapterWrite(TMP4):
+    original = os.path.join(DATA_DIR, "nero-chapters.m4b")
+
+    def _mdat_and_offsets(self, filename):
+        with open(filename, "rb") as fileobj:
+            atoms = Atoms(fileobj)
+            mdat = [a for a in atoms.atoms if a.name == b"mdat"][0]
+            ok, mdat_data = mdat.read(fileobj)
+            self.failUnless(ok)
+
+            offsets = []
+            moov = atoms[b"moov"]
+            for st in list(moov.findall(b"stco", True)) + \
+                    list(moov.findall(b"co64", True)):
+                ok, data = st.read(fileobj)
+                self.failUnless(ok)
+                count = struct.unpack(">I", data[4:8])[0]
+                width = 4 if st.name == b"stco" else 8
+                fmt = ">%dI" % count if width == 4 else ">%dQ" % count
+                offsets += list(
+                    struct.unpack(fmt, data[8:8 + width * count]))
+            return mdat_data, offsets
+
+    def test_edit_save_reload(self):
+        self.audio.chapters[0] = Chapter(0.0, "Intro")
+        self.audio.save()
+
+        audio = MP4(self.filename)
+        self.assertEqual(audio.chapters[0].title, "Intro")
+        # every other chapter is unchanged
+        self.assertEqual(
+            [(c.start, c.title) for c in audio.chapters[1:]],
+            [(c.start, c.title) for c in MP4(self.original).chapters[1:]])
+
+    def test_same_length_edit_keeps_atom_size(self):
+        with open(self.filename, "rb") as fileobj:
+            atoms = Atoms(fileobj)
+            old_chpl = atoms[b"moov", b"udta", b"chpl"]
+            ok, before = old_chpl.read(fileobj)
+            self.failUnless(ok)
+
+        # "AAA" has the same byte length as the original "001"
+        self.audio.chapters[0] = Chapter(0.0, "AAA")
+        self.audio.save()
+
+        with open(self.filename, "rb") as fileobj:
+            atoms = Atoms(fileobj)
+            new_chpl = atoms[b"moov", b"udta", b"chpl"]
+            ok, after = new_chpl.read(fileobj)
+            self.failUnless(ok)
+        # same size -> no resize, no offset changes
+        self.assertEqual(new_chpl.length, old_chpl.length)
+        self.assertEqual(len(after), len(before))
+        # only the edited title bytes differ; the first chapter entry is
+        # 8B start + 1B length + title (payload offset 18..21)
+        self.assertEqual(before[:18], after[:18])
+        self.assertEqual(after[18:21], b"AAA")
+        self.assertEqual(before[21:], after[21:])
+
+    def test_non_ascii_title(self):
+        title = u"第二章 中文 \U0001f3b5"
+        self.audio.chapters[3] = Chapter(
+            self.audio.chapters[3].start, title)
+        self.audio.save()
+
+        audio = MP4(self.filename)
+        self.assertEqual(audio.chapters[3].title, title)
+        self.assertEqual(len(audio.chapters), 112)
+
+    def test_grow_and_shrink_updates_offsets(self):
+        mdat_data, offsets = self._mdat_and_offsets(self.original)
+
+        self.audio.chapters[0] = Chapter(0.0, "Introduction!")
+        self.audio.save()
+        new_mdat, new_offsets = self._mdat_and_offsets(self.filename)
+        self.assertEqual(new_mdat, mdat_data)
+        delta = len("Introduction!".encode("utf-8")) - len("001")
+        self.assertEqual(new_offsets, [o + delta for o in offsets])
+
+        # shrink back; the audio data must still be untouched
+        audio = MP4(self.filename)
+        audio.chapters[0] = Chapter(0.0, "X")
+        audio.save()
+        new_mdat, new_offsets = self._mdat_and_offsets(self.filename)
+        self.assertEqual(new_mdat, mdat_data)
+        shrink = len("Introduction!".encode("utf-8")) - len("X")
+        self.assertEqual(new_offsets, [o + delta - shrink for o in offsets])
+
+    def test_zero_chapters(self):
+        self.audio.chapters = []
+        self.audio.save()
+
+        audio = MP4(self.filename)
+        self.assertIsInstance(audio.chapters, MP4Chapters)
+        self.assertEqual(len(audio.chapters), 0)
+
+        # chapters can be added back to an emptied file
+        audio.chapters.append(Chapter(1.5, u"新章节"))
+        audio.save()
+        audio = MP4(self.filename)
+        self.assertEqual(len(audio.chapters), 1)
+        self.assertEqual(audio.chapters[0], Chapter(1.5, u"新章节"))
+
+    def test_replace_all_chapters(self):
+        self.audio.chapters = [
+            Chapter(0, "A"), Chapter(10, "B"), Chapter(20, "C")]
+        del self.audio.chapters[1]
+        self.audio.chapters.insert(0, Chapter(0.5, "Z"))
+        self.audio.save()
+
+        audio = MP4(self.filename)
+        self.assertEqual(
+            [(c.start, c.title) for c in audio.chapters],
+            [(0.5, "Z"), (0.0, "A"), (20.0, "C")])
+
+    def test_slice_assignment(self):
+        self.audio.chapters[:2] = [Chapter(7, "sliced")]
+        self.audio.save()
+        audio = MP4(self.filename)
+        self.assertEqual(audio.chapters[0], Chapter(7, "sliced"))
+        self.assertEqual(len(audio.chapters), 111)
+
+    def test_invalid_chapter_type(self):
+        self.assertRaises(
+            TypeError, self.audio.chapters.append, "not a chapter")
+        self.assertRaises(
+            TypeError, self.audio.chapters.append, Chapter(0, b"bytes"))
+        self.assertRaises(
+            TypeError, self.audio.chapters.__setitem__, 0, (0, "tuple"))
+        self.assertRaises(
+            ValueError, self.audio.chapters.append, Chapter(-1, "neg"))
+
+    def test_tags_and_audio_preserved_on_chapter_save(self):
+        original_tags = dict(self.audio.tags)
+        mdat_data, offsets = self._mdat_and_offsets(self.original)
+
+        self.audio.chapters[0] = Chapter(0.0, "AAA")
+        self.audio.save()
+
+        audio = MP4(self.filename)
+        self.assertEqual(dict(audio.tags), original_tags)
+        new_mdat, new_offsets = self._mdat_and_offsets(self.filename)
+        self.assertEqual(new_mdat, mdat_data)
+        self.assertEqual(new_offsets, offsets)
+
+    def test_save_chapters_with_cover_and_text_together(self):
+        mdat_data, _ = self._mdat_and_offsets(self.original)
+        cover = MP4Cover(
+            b"\x89PNG\r\n\x1a\n" + b"0" * 200, MP4Cover.FORMAT_PNG)
+
+        self.audio["covr"] = [cover]
+        self.audio[u"\xa9nam"] = [u"Podcast Episode 标题"]
+        self.audio.chapters[2] = Chapter(
+            self.audio.chapters[2].start, u"Third 章")
+        self.audio.save()
+
+        audio = MP4(self.filename)
+        self.assertEqual(audio["covr"], [cover])
+        self.assertEqual(audio[u"\xa9nam"], [u"Podcast Episode 标题"])
+        self.assertEqual(audio.chapters[2].title, u"Third 章")
+        new_mdat, _ = self._mdat_and_offsets(self.filename)
+        self.assertEqual(new_mdat, mdat_data)
+
+    def test_chapter_equality(self):
+        self.assertEqual(Chapter(1.0, "a"), Chapter(1.0, "a"))
+        self.assertNotEqual(Chapter(1.0, "a"), Chapter(2.0, "a"))
+        self.assertNotEqual(Chapter(1.0, "a"), (1.0, "a"))
+
+
+class TMP4ChapterWriteNoChapters(TestCase):
+    """Files without a chpl box keep their behavior and can gain chapters."""
+
+    def setUp(self):
+        self.filename = get_temp_copy(
+            os.path.join(DATA_DIR, "has-tags.m4a"))
+        self.audio = MP4(self.filename)
+
+    def tearDown(self):
+        os.unlink(self.filename)
+
+    def test_no_chapters_is_none(self):
+        self.assertIsNone(self.audio.chapters)
+        self.audio[u"\xa9nam"] = ["just tags"]
+        self.audio.save()
+        self.assertIsNone(MP4(self.filename).chapters)
+
+    def test_add_chapters(self):
+        self.audio[u"\xa9nam"] = ["keep me"]
+        self.audio.chapters = [
+            Chapter(0.0, "Start"), Chapter(2.0, u"End 结束")]
+        self.audio.save()
+
+        audio = MP4(self.filename)
+        self.assertEqual(
+            [(c.start, c.title) for c in audio.chapters],
+            [(0.0, "Start"), (2.0, u"End 结束")])
+        # pre-existing tags survive
+        self.assertEqual(audio[u"\xa9nam"], ["keep me"])
+
+    def test_add_chapters_to_file_without_udta(self):
+        filename = get_temp_copy(os.path.join(DATA_DIR, "no-tags.m4a"))
+        try:
+            audio = MP4(filename)
+            self.assertIsNone(audio.chapters)
+            audio.add_tags()
+            audio.chapters = [Chapter(0.0, u"章节")]
+            audio.save()
+
+            reloaded = MP4(filename)
+            self.assertEqual(
+                [(c.start, c.title) for c in reloaded.chapters],
+                [(0.0, u"章节")])
+        finally:
+            os.unlink(filename)
 
 
 def call_faad(*args):
