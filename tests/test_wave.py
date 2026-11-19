@@ -1,11 +1,13 @@
 
 import os
+import struct
 from io import BytesIO
 
 import mutagen
 
-from mutagen.wave import WAVE
+from mutagen.wave import WAVE, WaveListInfo
 from mutagen._iff import InvalidChunk
+from mutagen._riff import RiffFile
 from tests import TestCase, DATA_DIR, get_temp_copy
 
 
@@ -244,3 +246,357 @@ class TWave(TestCase):
         id3.add(TORY(encoding=major, text="2011"))
         id3.add(TYER(encoding=major, text="2011"))
         id3.add(TDAT(encoding=major, text="2709"))
+
+
+class TWaveListInfo(TestCase):
+
+    INFO_FIELDS = {
+        u"IPRD": u"Quod Libet Test Data",
+        u"IART": u"piman, jzig",
+        u"IGNR": u"Silence",
+        u"INAM": u"Silence",
+        u"ICRD": u"2004",
+    }
+
+    def setUp(self):
+        self.fn_with_tags = os.path.join(
+            DATA_DIR, "silence-2s-PCM-44100-16-ID3v23.wav")
+        self.fn_no_tags = os.path.join(
+            DATA_DIR, "silence-2s-PCM-16000-08-notags.wav")
+
+        self.tmp_with_tags = get_temp_copy(self.fn_with_tags)
+        self.wav_with_tags = WAVE(self.tmp_with_tags)
+
+        self.tmp_no_tags = get_temp_copy(self.fn_no_tags)
+        self.wav_no_tags = WAVE(self.tmp_no_tags)
+
+    @staticmethod
+    def _raw_chunks(path):
+        riff = RiffFile(open(path, "rb"))
+        chunks = {}
+        with open(path, "rb") as fileobj:
+            for chunk in riff.root.subchunks():
+                fileobj.seek(chunk.offset)
+                chunks.setdefault(chunk.id, []).append(
+                    fileobj.read(chunk.size))
+        return chunks
+
+    @staticmethod
+    def _audio_chunks(path):
+        riff = RiffFile(open(path, "rb"))
+        result = {}
+        with open(path, "rb") as fileobj:
+            for chunk_id in (u"fmt", u"data"):
+                chunk = riff[chunk_id]
+                fileobj.seek(chunk.offset)
+                result[chunk_id] = fileobj.read(chunk.size)
+        return result
+
+    @staticmethod
+    def _info_list(path):
+        riff = RiffFile(open(path, "rb"))
+        for chunk in riff.root.subchunks():
+            if chunk.id == u"LIST" and chunk.name == u"INFO":
+                return chunk
+        return None
+
+    @staticmethod
+    def _raw_info_chunk(path):
+        chunk = TWaveListInfo._info_list(path)
+        if chunk is None:
+            return None
+        with open(path, "rb") as fileobj:
+            fileobj.seek(chunk.offset)
+            return fileobj.read(chunk.size)
+
+    def test_list_info_always_present(self):
+        self.assertIsInstance(self.wav_with_tags.list_info, WaveListInfo)
+        self.assertIsInstance(self.wav_no_tags.list_info, WaveListInfo)
+        self.assertEqual(len(self.wav_no_tags.list_info), 0)
+
+    def test_read_existing_info_fields(self):
+        list_info = self.wav_with_tags.list_info
+        for key, value in self.INFO_FIELDS.items():
+            self.assertEqual(list_info[key], value)
+        # ITRK differs between the two test files, just make sure it reads
+        self.assertIn(u"ITRK", list_info)
+        self.assertEqual(
+            set(list_info.keys()),
+            {u"IPRD", u"IART", u"IGNR", u"INAM", u"ITRK", u"ICRD"})
+
+    def test_dict_interface(self):
+        list_info = self.wav_with_tags.list_info
+        self.assertIn(u"INAM", list_info)
+        self.assertNotIn(u"XXXX", list_info)
+        self.assertEqual(list_info.get(u"XXXX", u"default"), u"default")
+        self.assertEqual(len(list_info), 6)
+        self.assertEqual(set(list_info.items()),
+                         {(k, list_info[k]) for k in list_info})
+        self.assertEqual(sorted(list_info.values()),
+                         sorted(list_info._tags.values()))
+        self.assertIn(u"INAM=Silence", list_info.pprint())
+
+    def test_info_and_id3_coexist(self):
+        self.assertIsNotNone(self.wav_with_tags.tags)
+        self.assertEqual(self.wav_with_tags[u"TIT2"], [u"Silence"])
+        self.assertEqual(self.wav_with_tags.list_info[u"INAM"], u"Silence")
+
+    def test_noop_save_is_byte_identical(self):
+        before = open(self.tmp_with_tags, "rb").read()
+        self.wav_with_tags.list_info.save()
+        self.assertEqual(open(self.tmp_with_tags, "rb").read(), before)
+
+        # Saving through the WAVE object must leave the INFO chunk alone
+        # (the ID3 tag itself may be re-encoded, that is existing behavior)
+        info_before = self._raw_info_chunk(self.tmp_with_tags)
+        self.wav_with_tags.save()
+        self.assertEqual(self._raw_info_chunk(self.tmp_with_tags),
+                         info_before)
+
+    def test_modified_field_roundtrip_and_untouched_bytes(self):
+        original_chunks = self._raw_chunks(self.tmp_with_tags)
+        self.wav_with_tags.list_info[u"INAM"] = u"New Title"
+        self.wav_with_tags.list_info.save()
+
+        reloaded = WAVE(self.tmp_with_tags)
+        self.assertEqual(reloaded.list_info[u"INAM"], u"New Title")
+        self.assertEqual(reloaded.list_info[u"IART"], u"piman, jzig")
+
+        new_chunks = self._raw_chunks(self.tmp_with_tags)
+        # Audio data, fmt chunk and ID3 chunk are byte identical
+        self.assertEqual(new_chunks[u"fmt"], original_chunks[u"fmt"])
+        self.assertEqual(new_chunks[u"data"], original_chunks[u"data"])
+        self.assertEqual(new_chunks[u"id3"], original_chunks[u"id3"])
+
+        # Every unmodified INFO field keeps its exact on-disk bytes
+        def subfield(raw, field_id):
+            index = raw.index(field_id)
+            size = struct.unpack("<I", raw[index + 4:index + 8])[0]
+            return raw[index:index + 8 + size + (size % 2)]
+
+        before = self._raw_info_chunk(self.fn_with_tags)
+        after = self._raw_info_chunk(self.tmp_with_tags)
+        for field_id in (b"IPRD", b"IART", b"IGNR", b"ITRK", b"ICRD"):
+            self.assertEqual(subfield(before, field_id),
+                             subfield(after, field_id))
+
+    def test_read_modify_read_two_cycles(self):
+        for cycle in range(2):
+            wav = WAVE(self.tmp_with_tags)
+            wav.list_info[u"INAM"] = u"Title %d" % cycle
+            wav.list_info[u"ICMT"] = u"Comment %d" % cycle
+            wav.list_info.pop(u"IGNR", None)
+            wav.list_info.save()
+
+        final = WAVE(self.tmp_with_tags)
+        self.assertEqual(final.list_info[u"INAM"], u"Title 1")
+        self.assertEqual(final.list_info[u"ICMT"], u"Comment 1")
+        self.assertNotIn(u"IGNR", final.list_info)
+        self.assertEqual(self._audio_chunks(self.tmp_with_tags),
+                         self._audio_chunks(self.fn_with_tags))
+
+    def test_add_field_to_existing_info(self):
+        self.wav_with_tags.list_info[u"ICMT"] = u"a comment"
+        self.wav_with_tags.list_info.save()
+
+        reloaded = WAVE(self.tmp_with_tags)
+        self.assertEqual(reloaded.list_info[u"ICMT"], u"a comment")
+        self.assertEqual(reloaded.list_info[u"INAM"], u"Silence")
+
+    def test_delete_field(self):
+        del self.wav_with_tags.list_info[u"ICRD"]
+        self.wav_with_tags.list_info.save()
+
+        reloaded = WAVE(self.tmp_with_tags)
+        self.assertNotIn(u"ICRD", reloaded.list_info)
+        self.assertEqual(reloaded.list_info[u"INAM"], u"Silence")
+        self.assertEqual(self._audio_chunks(self.tmp_with_tags),
+                         self._audio_chunks(self.fn_with_tags))
+
+    def test_odd_and_even_length_chunks(self):
+        list_info = self.wav_no_tags.list_info
+        list_info[u"INAM"] = u"AB"   # 2 chars + NUL = 3 bytes -> 1 pad byte
+        list_info[u"IART"] = u"ABC"  # 3 chars + NUL = 4 bytes -> no padding
+        list_info.save()
+
+        info = self._info_list(self.tmp_no_tags)
+        subchunks = {chunk.id: chunk for chunk in info.subchunks()}
+        self.assertEqual(subchunks[u"INAM"].data_size, 3)
+        self.assertEqual(subchunks[u"INAM"].padding(), 1)
+        self.assertEqual(subchunks[u"IART"].data_size, 4)
+        self.assertEqual(subchunks[u"IART"].padding(), 0)
+
+        reloaded = WAVE(self.tmp_no_tags)
+        self.assertEqual(reloaded.list_info[u"INAM"], u"AB")
+        self.assertEqual(reloaded.list_info[u"IART"], u"ABC")
+
+        # Resize the odd chunk to an even length and verify the padding
+        # byte is removed correctly.
+        reloaded.list_info[u"INAM"] = u"ABC"  # 3 chars + NUL = 4 bytes
+        reloaded.list_info.save()
+
+        info = self._info_list(self.tmp_no_tags)
+        subchunks = {chunk.id: chunk for chunk in info.subchunks()}
+        self.assertEqual(subchunks[u"INAM"].data_size, 4)
+        self.assertEqual(subchunks[u"INAM"].padding(), 0)
+        self.assertEqual(WAVE(self.tmp_no_tags).list_info[u"INAM"], u"ABC")
+
+    def test_odd_length_chunk_deletion(self):
+        list_info = self.wav_no_tags.list_info
+        list_info[u"INAM"] = u"AB"  # odd data size, requires padding
+        list_info[u"IART"] = u"Artist"
+        list_info.save()
+        del list_info[u"INAM"]
+        list_info.save()
+
+        reloaded = WAVE(self.tmp_no_tags)
+        self.assertNotIn(u"INAM", reloaded.list_info)
+        self.assertEqual(reloaded.list_info[u"IART"], u"Artist")
+        self.assertEqual(self._audio_chunks(self.tmp_no_tags),
+                         self._audio_chunks(self.fn_no_tags))
+
+    def test_missing_info_block(self):
+        self.assertIsNone(self._info_list(self.tmp_no_tags))
+
+        # Saving an empty mapping must not create anything
+        before = open(self.tmp_no_tags, "rb").read()
+        self.wav_no_tags.list_info.save()
+        self.assertEqual(open(self.tmp_no_tags, "rb").read(), before)
+
+        # Creating the INFO block from scratch works
+        self.wav_no_tags.list_info[u"INAM"] = u"Created"
+        self.wav_no_tags.list_info.save()
+
+        reloaded = WAVE(self.tmp_no_tags)
+        self.assertEqual(reloaded.list_info[u"INAM"], u"Created")
+        self.assertIsNone(reloaded.tags)
+        self.assertEqual(self._audio_chunks(self.tmp_no_tags),
+                         self._audio_chunks(self.fn_no_tags))
+
+    def test_delete_info_chunk(self):
+        self.assertIsNotNone(self._info_list(self.tmp_with_tags))
+        self.wav_with_tags.list_info.delete()
+
+        reloaded = WAVE(self.tmp_with_tags)
+        self.assertEqual(len(reloaded.list_info), 0)
+        self.assertIsNone(self._info_list(self.tmp_with_tags))
+        # ID3 tag and audio data are untouched
+        self.assertIsNotNone(reloaded.tags)
+        self.assertEqual(self._audio_chunks(self.tmp_with_tags),
+                         self._audio_chunks(self.fn_with_tags))
+
+    def test_save_empty_mapping_removes_info_chunk(self):
+        self.wav_with_tags.list_info.clear()
+        self.wav_with_tags.list_info.save()
+        self.assertIsNone(self._info_list(self.tmp_with_tags))
+        self.assertIsNotNone(WAVE(self.tmp_with_tags).tags)
+
+    def test_wave_delete_removes_info_and_id3(self):
+        self.wav_with_tags.delete()
+        reloaded = WAVE(self.tmp_with_tags)
+        self.assertIsNone(reloaded.tags)
+        self.assertEqual(len(reloaded.list_info), 0)
+        self.assertIsNone(self._info_list(self.tmp_with_tags))
+        self.assertEqual(self._audio_chunks(self.tmp_with_tags),
+                         self._audio_chunks(self.fn_with_tags))
+
+    def test_info_and_id3_do_not_interfere(self):
+        from mutagen.id3 import TIT1
+
+        wav = self.wav_with_tags
+        wav.tags.add(TIT1(encoding=3, text=u"id3-only"))
+        wav.list_info[u"INAM"] = u"info-only"
+        wav.save()
+
+        reloaded = WAVE(self.tmp_with_tags)
+        self.assertEqual(reloaded.tags[u"TIT1"], [u"id3-only"])
+        self.assertEqual(reloaded.list_info[u"INAM"], u"info-only")
+
+        # An INFO save leaves the ID3 chunk bytes exactly as they were
+        id3_before = self._raw_chunks(self.tmp_with_tags)[u"id3"]
+        reloaded.list_info[u"IART"] = u"touched"
+        reloaded.list_info.save()
+        self.assertEqual(self._raw_chunks(self.tmp_with_tags)[u"id3"],
+                         id3_before)
+
+        # An ID3 save leaves the INFO chunk bytes exactly as they were
+        info_before = self._raw_info_chunk(self.tmp_with_tags)
+        WAVE(self.tmp_with_tags).tags.save()
+        self.assertEqual(self._raw_info_chunk(self.tmp_with_tags),
+                         info_before)
+
+    def test_duplicate_field_identifiers(self):
+        with open(self.tmp_no_tags, "rb+") as fileobj:
+            riff = RiffFile(fileobj)
+            info = riff.root.insert_chunk(u"LIST", b"INFO")
+            info.insert_chunk(u"INAM", b"First\x00")
+            info.insert_chunk(u"INAM", b"Second\x00")
+            info.insert_chunk(u"IART", b"Artist\x00")
+
+        wav = WAVE(self.tmp_no_tags)
+        self.assertEqual(wav.list_info[u"INAM"], u"First")
+        wav.list_info[u"INAM"] = u"Merged"
+        wav.list_info.save()
+
+        reloaded = WAVE(self.tmp_no_tags)
+        self.assertEqual(reloaded.list_info[u"INAM"], u"Merged")
+        self.assertEqual(reloaded.list_info[u"IART"], u"Artist")
+        info = self._info_list(self.tmp_no_tags)
+        identifiers = [chunk.id for chunk in info.subchunks()]
+        self.assertEqual(identifiers.count(u"INAM"), 1)
+
+    def test_multiple_list_chunks_non_info_ignored(self):
+        with open(self.tmp_no_tags, "rb+") as fileobj:
+            riff = RiffFile(fileobj)
+            other = riff.root.insert_chunk(u"LIST", b"adtl")
+            other.insert_chunk(u"labl", b"hello\x00")
+
+        wav = WAVE(self.tmp_no_tags)
+        self.assertEqual(len(wav.list_info), 0)
+
+        # Saving empty tags must leave the adtl LIST chunk untouched
+        before = open(self.tmp_no_tags, "rb").read()
+        wav.list_info.save()
+        self.assertEqual(open(self.tmp_no_tags, "rb").read(), before)
+
+        # A newly created INFO chunk coexists with the adtl chunk
+        wav.list_info[u"INAM"] = u"x"
+        wav.list_info.save()
+        riff = RiffFile(open(self.tmp_no_tags, "rb"))
+        list_types = sorted(
+            chunk.name for chunk in riff.root.subchunks()
+            if chunk.id == u"LIST")
+        self.assertEqual(list_types, [u"INFO", u"adtl"])
+        self.assertEqual(WAVE(self.tmp_no_tags).list_info.keys(),
+                         [u"INAM"])
+
+    def test_standalone_constructor_and_fileobj(self):
+        self.assertEqual(len(WaveListInfo()), 0)
+
+        list_info = WaveListInfo(self.fn_with_tags)
+        self.assertEqual(list_info[u"INAM"], u"Silence")
+
+        list_info[u"INAM"] = u"ViaFileObj"
+        with open(self.tmp_with_tags, "rb+") as fileobj:
+            list_info.save(fileobj)
+        with open(self.tmp_with_tags, "rb") as fileobj:
+            self.assertEqual(WaveListInfo(fileobj)[u"INAM"], u"ViaFileObj")
+
+    def test_value_and_key_validation(self):
+        list_info = self.wav_no_tags.list_info
+        with self.failUnlessRaises(TypeError):
+            list_info[u"INAM"] = 123
+        with self.failUnlessRaises(ValueError):
+            list_info[u""] = u"value"
+
+    def test_empty_string_value(self):
+        self.wav_no_tags.list_info[u"INAM"] = u""
+        self.wav_no_tags.list_info.save()
+        reloaded = WAVE(self.tmp_no_tags)
+        self.assertEqual(reloaded.list_info[u"INAM"], u"")
+        # And grow the empty field again
+        reloaded.list_info[u"INAM"] = u"not empty anymore"
+        reloaded.list_info.save()
+        self.assertEqual(
+            WAVE(self.tmp_no_tags).list_info[u"INAM"],
+            u"not empty anymore")
