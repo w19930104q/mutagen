@@ -1,3 +1,13 @@
+.. _release-1.48.2:
+
+1.48.2
+------
+
+* SMF: Calculate the duration of files with an SMPTE time division instead
+  of failing, and take tempo changes throughout the whole song into account
+  rather than assuming a fixed 120 BPM. Corrupt events now raise an
+  ``SMFError`` naming the track and offset.
+
 .. _release-1.48.1:
 
 1.48.1 - 2026-06-25
