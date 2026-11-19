@@ -33,7 +33,7 @@ class TVariousFrames(TestCase):
         ['TCMP', b'\x001', '1', 1, dict(encoding=0)],
         ['TCMP', b'\x000', '0', 0, dict(encoding=0)],
         ['TCOM', b'\x00a/b', 'a/b', '', dict(encoding=0)],
-        ['TCON', b'\x00(21)Disco', '(21)Disco', '', dict(encoding=0)],
+        ['TCON', b'\x00(21)Disco', 'Ska\x00Disco', '', dict(encoding=0)],
         ['TCOP', b'\x001900 c', '1900 c', '', dict(encoding=0)],
         ['TDAT', b'\x00a/b', 'a/b', '', dict(encoding=0)],
         ['TDEN', b'\x001987', '1987', '', dict(encoding=0, year=[1987])],
@@ -1332,6 +1332,34 @@ class TTCON(TestCase):
         gen.genres = gen.genres
         self.assertEquals(gen.genres, [u"Unknown", u"genre"])
 
+    def test_string_view_matches_genres(self):
+        # The frame's string view (iteration, indexing, str(), equality)
+        # is the parsed genre list, identical to EasyID3's "genre" key,
+        # while the unparsed values stay available through .text.
+        gen = TCON(encoding=3, text=[u"17", u"(21)Disco", u"CR"])
+        self.assertEquals(gen.genres,
+                          [u"Rock", u"Ska", u"Disco", u"Cover"])
+        self.assertEquals(list(gen), gen.genres)
+        self.assertEquals(gen[0], u"Rock")
+        self.assertEquals(gen[1:3], [u"Ska", u"Disco"])
+        self.assertEquals(str(gen), u"\x00".join(gen.genres))
+        self.assertEquals(gen, gen.genres)
+        self.assertEquals(gen, u"\x00".join(gen.genres))
+        # raw data is untouched
+        self.assertEquals(gen.text, [u"17", u"(21)Disco", u"CR"])
+
+    def test_string_view_plain_text(self):
+        gen = TCON(encoding=3, text=[u"Rock", u"Pop"])
+        self.assertEquals(list(gen), [u"Rock", u"Pop"])
+        self.assertEquals(gen, [u"Rock", u"Pop"])
+        self.assertEquals(str(gen), u"Rock\x00Pop")
+
+    def test_string_view_empty(self):
+        gen = TCON(encoding=0, text=u"")
+        self.assertEquals(list(gen), [])
+        self.assertEquals(str(gen), u"")
+        self.assertEquals(gen, [])
+
 
 class TID3TimeStamp(TestCase):
 
@@ -1403,6 +1431,37 @@ class TID3TimeStamp(TestCase):
             str(ID3TimeStamp(u"2000-01-01")), u"2000-01-01")
         self.assertEquals(
             bytes(ID3TimeStamp(u"2000-01-01")), b"2000-01-01")
+
+    def test_is_str(self):
+        # The raw frame view must expose the same plain strings as the
+        # EasyID3 "date"/"originaldate" keys, so a time stamp is a str
+        # subclass that compares item-by-item with ordinary strings.
+        stamp = ID3TimeStamp(u"2000-01-01")
+        self.assertTrue(isinstance(stamp, str))
+        self.assertEqual(stamp, u"2000-01-01")
+        self.assertEqual(u"2000-01-01", stamp)
+        self.assertEqual(hash(stamp), hash(u"2000-01-01"))
+        self.assertTrue(stamp.startswith(u"2000"))
+        self.assertEqual(stamp.split(u"-"), [u"2000", u"01", u"01"])
+
+    def test_str_equality_preserves_components(self):
+        stamp = ID3TimeStamp(u"2000-01-02 03:04:05")
+        self.assertEqual(stamp, str(stamp))
+        self.assertEqual(stamp.text, u"2000-01-02 03:04:05")
+        self.assertEqual(
+            (stamp.year, stamp.month, stamp.day,
+             stamp.hour, stamp.minute, stamp.second),
+            (2000, 1, 2, 3, 4, 5))
+
+    def test_copy_constructor(self):
+        stamp = ID3TimeStamp(ID3TimeStamp(u"2000-05"))
+        self.assertTrue(isinstance(stamp, ID3TimeStamp))
+        self.assertEqual(stamp, u"2000-05")
+        self.assertEqual(stamp.month, 5)
+
+    def test_set_membership_with_plain_str(self):
+        self.assertEqual(
+            len({ID3TimeStamp(u"2004"), ID3TimeStamp(u"2004"), u"2004"}), 1)
 
 
 class TFrameTest(object):

@@ -5,6 +5,11 @@
 
 * Revert: ``ID3: Fix saving ID3v2 comment fields from COMM:desc:lang tags``
   to fix duplicated COMM frames in some cases. :pr:`713`
+* ID3: Make ``ID3TimeStamp`` a ``str`` subclass and align the ``TCON`` frame's
+  string view (iteration, indexing, ``str()``, equality) with its parsed
+  ``genres``. The raw frame view and the EasyID3 ``date``/``originaldate``/
+  ``genre`` keys now return item-by-item identical strings, while per-frame
+  attributes (``TDRC.text`` components, ``TCON.text``) keep their old behavior.
 
 .. _release-1.48.0:
 

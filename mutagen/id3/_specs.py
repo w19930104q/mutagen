@@ -641,7 +641,7 @@ class Latin1TextListSpec(Spec):
 
 
 @total_ordering
-class ID3TimeStamp(object):
+class ID3TimeStamp(str):
     """A time stamp in ID3v2 format.
 
     This is a restricted form of the ISO 8601 standard; time stamps
@@ -649,18 +649,31 @@ class ID3TimeStamp(object):
         YYYY-MM-DD HH:MM:SS
     Or some partial form (YYYY-MM-DD HH, YYYY, etc.).
 
+    This is a ``str`` subclass, so a time stamp compares and behaves as
+    the plain string returned by its ``text`` attribute. That keeps the
+    raw frame view (``frame.text`` / iterating the frame) item-by-item
+    identical to the string view exposed by EasyID3's ``date`` and
+    ``originaldate`` keys, while the parsed ``year``/``month``/...
+    attributes remain available.
+
     The 'text' attribute contains the raw text data of the time stamp.
     """
 
     import re
 
-    def __init__(self, text):
+    def __new__(cls, text):
         if isinstance(text, ID3TimeStamp):
             text = text.text
         elif not isinstance(text, str):
             raise TypeError("not a str")
 
-        self.text = text
+        obj = str.__new__(cls, text)
+        obj.set_text(text)
+        return obj
+
+    def __init__(self, text):
+        # __new__ already parsed and stored the components; nothing to do.
+        pass
 
     __formats = ['%04d'] + ['%02d'] * 5
     __seps = ['-', '-', ' ', ':', ':', 'x']
@@ -697,12 +710,17 @@ class ID3TimeStamp(object):
         return repr(self.text)
 
     def __eq__(self, other):
-        return isinstance(other, ID3TimeStamp) and self.text == other.text
+        if isinstance(other, ID3TimeStamp):
+            other = other.text
+        return self.text == other
 
     def __lt__(self, other):
-        return self.text < other.text
+        if isinstance(other, ID3TimeStamp):
+            other = other.text
+        return self.text < other
 
-    __hash__ = object.__hash__
+    def __hash__(self):
+        return hash(self.text)
 
     def encode(self, *args):
         return self.text.encode(*args)

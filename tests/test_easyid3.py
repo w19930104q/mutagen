@@ -3,7 +3,9 @@ import os
 import pickle
 
 from mutagen import MutagenError
-from mutagen.id3 import ID3FileType, ID3, RVA2, CHAP, TDRC, CTOC, TSO2, TXXX
+from mutagen.id3 import (
+    ID3FileType, ID3, RVA2, CHAP, TDRC, TDOR, CTOC, TSO2, TXXX, TCON,
+    ID3TimeStamp)
 from mutagen.easyid3 import EasyID3, error as ID3Error
 
 from tests import TestCase, DATA_DIR, get_temp_copy
@@ -470,3 +472,92 @@ class TEasyID3(TestCase):
         self.assertEqual(len(self.realid3), 0)
 
         self.failUnlessRaises(KeyError, self.id3.__delitem__, "albumartistsort")
+
+    # --- The simplified view and the raw frame view must agree on every
+    # public field: reading the same tag yields item-by-item identical
+    # strings through either view, and a value written through either
+    # view reads back identically through both. ---
+
+    def test_date_views_agree_item_by_item(self):
+        self.id3["date"] = [u"2004", u"2005-06-07 09:10"]
+        raw = self.realid3["TDRC"]
+        self.assertEqual(self.id3["date"], list(raw))
+        self.assertEqual(self.id3["date"], [s.text for s in raw.text])
+        for easy_value, raw_value in zip(self.id3["date"], raw):
+            self.assertIsInstance(raw_value, str)
+            self.assertEqual(easy_value, raw_value)
+            self.assertTrue(raw_value == easy_value)
+
+    def test_originaldate_views_agree_item_by_item(self):
+        self.id3["originaldate"] = [u"1999", u"2001-12"]
+        raw = self.realid3["TDOR"]
+        self.assertEqual(self.id3["originaldate"], list(raw))
+        self.assertIsInstance(raw.text[0], ID3TimeStamp)
+        self.assertIsInstance(raw.text[0], str)
+
+    def test_timestamps_are_strings_in_raw_frame(self):
+        self.id3["date"] = u"2004"
+        stamp = self.realid3["TDRC"].text[0]
+        self.assertIsInstance(stamp, ID3TimeStamp)
+        self.assertEqual(stamp, u"2004")
+        self.assertEqual(hash(stamp), hash(u"2004"))
+
+    def test_genre_views_agree_on_coded_raw_frame(self):
+        # A raw TCON using numeric/coded genres must read identically via
+        # the EasyID3 "genre" key and the raw frame's string view.
+        self.realid3.add(TCON(encoding=3, text=[u"17", u"(21)Disco", u"CR"]))
+        expected = self.realid3["TCON"].genres
+        self.assertEqual(self.id3["genre"], expected)
+        self.assertEqual(list(self.realid3["TCON"]), expected)
+        self.assertEqual(self.id3["genre"], list(self.realid3["TCON"]))
+        # the unparsed raw text is still available
+        self.assertEqual(
+            self.realid3["TCON"].text, [u"17", u"(21)Disco", u"CR"])
+
+    def test_genre_written_easy_reads_same_in_raw(self):
+        self.id3["genre"] = [u"Rock", u"Pop"]
+        self.assertEqual(
+            self.id3["genre"], list(self.realid3["TCON"]))
+        self.assertEqual(
+            self.id3["genre"], self.realid3["TCON"].genres)
+
+    def test_text_frame_views_agree(self):
+        for key, frameid in [
+            ("title", "TIT2"), ("artist", "TPE1"), ("album", "TALB"),
+            ("tracknumber", "TRCK"), ("discnumber", "TPOS"),
+            ("composer", "TCOM"), ("isrc", "TSRC"),
+        ]:
+            self.id3[key] = [u"first value", u"second value"]
+            self.assertEqual(
+                self.id3[key], list(self.realid3[frameid]))
+            for value in self.realid3[frameid]:
+                self.assertIsInstance(value, str)
+
+    def test_txxx_views_agree(self):
+        self.id3["asin"] = [u"B0001", u"B0002"]
+        self.assertEqual(
+            self.id3["asin"], list(self.realid3["TXXX:ASIN"]))
+
+    def test_write_easy_readback_raw_after_save(self):
+        self.id3["title"] = [u"T1", u"T2"]
+        self.id3["date"] = [u"2004", u"2005-01"]
+        self.id3["genre"] = [u"Rock", u"Pop"]
+        self.id3["asin"] = [u"B1"]
+        self.id3.save(self.filename)
+
+        easy = EasyID3(self.filename)
+        raw = ID3(self.filename)
+        self.assertEqual(easy["title"], list(raw["TIT2"]))
+        self.assertEqual(easy["date"], list(raw["TDRC"]))
+        self.assertEqual(easy["genre"], list(raw["TCON"]))
+        self.assertEqual(easy["asin"], list(raw["TXXX:ASIN"]))
+        self.assertTrue(all(isinstance(v, str) for v in raw["TDRC"]))
+
+    def test_write_raw_readback_easy_after_save(self):
+        self.realid3.add(TDRC(encoding=3, text=[u"2010-05-01"]))
+        self.realid3.add(TCON(encoding=3, text=[u"Jazz", u"Blues"]))
+        self.realid3.save(self.filename)
+
+        easy = EasyID3(self.filename)
+        self.assertEqual(easy["date"], [u"2010-05-01"])
+        self.assertEqual(easy["genre"], [u"Jazz", u"Blues"])

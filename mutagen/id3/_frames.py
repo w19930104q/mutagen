@@ -557,6 +557,11 @@ class TCON(TextFrame):
 
     ID3 has several ways genres can be represented; for convenience,
     use the 'genres' property rather than the 'text' attribute.
+
+    The frame's string view (iterating the frame, indexing it, or
+    ``str(frame)``) is the parsed ``genres`` list, so it stays
+    item-by-item identical to EasyID3's ``genre`` key. The unparsed
+    values remain available through the ``text`` attribute.
     """
 
     from mutagen._constants import GENRES
@@ -618,6 +623,26 @@ class TCON(TextFrame):
 
     genres = property(__get_genres, __set_genres, None,
                       "A list of genres parsed from the raw text data.")
+
+    # The string view of the frame exposes the parsed genres rather than
+    # the raw (possibly numeric/coded) text, matching EasyID3's "genre".
+    def __str__(self):
+        return u'\u0000'.join(self.genres)
+
+    def __iter__(self):
+        return iter(self.genres)
+
+    def __getitem__(self, item):
+        return self.genres[item]
+
+    def __eq__(self, other):
+        if isinstance(other, bytes):
+            return bytes(self) == other
+        elif isinstance(other, str):
+            return str(self) == other
+        return self.genres == other
+
+    __hash__ = Frame.__hash__
 
     def _pprint(self):
         return " / ".join(self.genres)
