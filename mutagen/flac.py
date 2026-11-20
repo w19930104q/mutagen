@@ -333,6 +333,80 @@ class SeekTable(MetadataBlock):
             f.write(packed)
         return f.getvalue()
 
+    @staticmethod
+    def __is_frame_sync(fileobj, offset):
+        """Whether a FLAC frame starts at the given file offset.
+
+        A FLAC frame starts with a 14 bit sync code (0xFFF8..0xFFFE),
+        the last two bits being reserved and required to be zero.
+        """
+
+        if offset < 0:
+            return False
+        fileobj.seek(offset)
+        header = fileobj.read(2)
+        return (len(header) == 2 and header[0] == 0xFF and
+                (header[1] & 0xFC) == 0xF8)
+
+    def uses_absolute_offsets(self, audio_offset, fileobj):
+        """Check if the seek points contain absolute file offsets.
+
+        The FLAC specification requires the seek point byte offset to be
+        relative to the start of the first audio frame, but files written
+        by other implementations sometimes contain absolute file offsets.
+
+        Args:
+            audio_offset (`int`): absolute file offset of the first frame
+            fileobj (fileobj): the FLAC file, opened for reading
+        Returns:
+            `bool`: `True` if the verifiable seek points only resolve to
+            real frames when treated as absolute file offsets, `False`
+            otherwise (including spec compliant relative offsets)
+        """
+
+        position = fileobj.tell()
+        absolute = relative = 0
+        try:
+            for seekpoint in self.seekpoints:
+                if seekpoint.first_sample == 0xFFFFFFFFFFFFFFFF:
+                    # placeholder points have an undefined byte offset
+                    continue
+                offset = seekpoint.byte_offset
+                if self.__is_frame_sync(fileobj, audio_offset + offset):
+                    relative += 1
+                if self.__is_frame_sync(fileobj, offset):
+                    absolute += 1
+        finally:
+            fileobj.seek(position)
+
+        return absolute > 0 and relative == 0
+
+    def make_relative_offsets(self, old_audio_offset, new_audio_offset):
+        """Convert absolute file offsets to spec compliant offsets.
+
+        The FLAC specification requires the seek point byte offset to be
+        relative to the start of the first audio frame. The audio frames
+        moved from ``old_audio_offset`` to ``new_audio_offset`` (both
+        absolute file offsets of the first frame), so the absolute seek
+        point offsets are shifted by the same amount and then made
+        relative. Placeholder seek points are left untouched.
+
+        Args:
+            old_audio_offset (`int`): absolute offset of the first frame
+                before the metadata resize
+            new_audio_offset (`int`): absolute offset of the first frame
+                after the metadata resize
+        """
+
+        delta = new_audio_offset - old_audio_offset
+        self.seekpoints = [
+            seekpoint if
+            seekpoint.first_sample == 0xFFFFFFFFFFFFFFFF else
+            SeekPoint(seekpoint.first_sample,
+                      seekpoint.byte_offset + delta - new_audio_offset,
+                      seekpoint.num_samples)
+            for seekpoint in self.seekpoints]
+
     def __repr__(self):
         return "<%s seekpoints=%r>" % (type(self).__name__, self.seekpoints)
 
@@ -875,6 +949,22 @@ class FLAC(mutagen.FileType):
         data = MetadataBlock._writeblocks(
             metadata_blocks, available, content_size, padding)
         data_size = len(data)
+
+        # Resizing the metadata section moves all audio frames. Seek tables
+        # using spec compliant offsets relative to the first frame stay
+        # valid on their own, but ones containing absolute file offsets have
+        # to be rewritten. Normalize them to offsets relative to the new
+        # first audio frame before the file content is moved.
+        if data_size != available:
+            seektable = self.seektable
+            if seektable is not None and seektable in metadata_blocks:
+                if seektable.uses_absolute_offsets(
+                        audio_offset, filething.fileobj):
+                    seektable.make_relative_offsets(
+                        audio_offset, header + data_size)
+                    data = MetadataBlock._writeblocks(
+                        metadata_blocks, available, content_size, padding)
+                    data_size = len(data)
 
         resize_bytes(filething.fileobj, available, data_size, header)
         f.seek(header - 4)

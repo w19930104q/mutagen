@@ -7,7 +7,8 @@ import pytest
 from mutagen import MutagenError
 from mutagen.id3 import ID3, TIT2, ID3NoHeaderError
 from mutagen.flac import to_int_be, Padding, VCFLACDict, MetadataBlock, error
-from mutagen.flac import StreamInfo, SeekTable, CueSheet, FLAC, delete, Picture
+from mutagen.flac import StreamInfo, SeekPoint, SeekTable, CueSheet, FLAC, \
+    delete, Picture
 from mutagen._vorbis import VComment
 
 from tests import TestCase, DATA_DIR, get_temp_copy
@@ -169,6 +170,194 @@ class TSeekTable(TestCase):
 
     def test_roundtrip(self):
         self.failUnlessEqual(SeekTable(self.st.write()), self.st)
+
+
+class TSeekTableOffsets(TestCase):
+    """Seek points must keep pointing at real frames after metadata resizes.
+
+    The FLAC spec requires seek point offsets relative to the first audio
+    frame, but some files contain absolute file offsets. Resizing the
+    metadata section moves the audio frames, so the latter have to be
+    rewritten on save.
+    """
+
+    SAMPLE = os.path.join(DATA_DIR, "silence-44-s.flac")
+    PLACEHOLDER = 0xFFFFFFFFFFFFFFFF
+
+    def setUp(self):
+        self.NEW = get_temp_copy(self.SAMPLE)
+        self.flac = FLAC(self.NEW)
+        self.original_points = list(self.flac.seektable.seekpoints)
+
+    def tearDown(self):
+        os.unlink(self.NEW)
+
+    @staticmethod
+    def _is_frame_sync(data, offset):
+        return (0 <= offset and offset + 1 < len(data) and
+                data[offset] == 0xFF and
+                (data[offset + 1] & 0xFC) == 0xF8)
+
+    def _audio_offset(self, flac):
+        offset = 4
+        for block in flac.metadata_blocks:
+            offset += 4 + len(block.write())
+        return offset
+
+    def _make_absolute(self):
+        audio_offset = self._audio_offset(self.flac)
+        self.flac.seektable.seekpoints = [
+            point if point.first_sample == self.PLACEHOLDER else
+            SeekPoint(point.first_sample,
+                      audio_offset + point.byte_offset, point.num_samples)
+            for point in self.flac.seektable.seekpoints]
+        # keep the metadata section the same size so the save does not
+        # normalize the table itself (that resize path is covered by the
+        # other tests); the padding block absorbs the content change
+        current_padding = self.flac.metadata_blocks[-1].length
+        self.flac.save(padding=lambda x: current_padding)
+        self.flac = FLAC(self.NEW)
+        with open(self.NEW, "rb") as h:
+            self.failUnless(self.flac.seektable.uses_absolute_offsets(
+                self._audio_offset(self.flac), h))
+
+    def _assert_seekpoints_point_at_frames(self):
+        with open(self.NEW, "rb") as h:
+            data = h.read()
+        flac = FLAC(self.NEW)
+        audio_offset = self._audio_offset(flac)
+        for point in flac.seektable.seekpoints:
+            if point.first_sample == self.PLACEHOLDER:
+                continue
+            self.failUnless(self._is_frame_sync(
+                data, audio_offset + point.byte_offset))
+
+    def test_detect_relative_offsets(self):
+        with open(self.NEW, "rb") as h:
+            self.failIf(self.flac.seektable.uses_absolute_offsets(
+                self._audio_offset(self.flac), h))
+
+    def test_detect_absolute_offsets(self):
+        self._make_absolute()
+        with open(self.NEW, "rb") as h:
+            self.failUnless(self.flac.seektable.uses_absolute_offsets(
+                self._audio_offset(self.flac), h))
+
+    def test_make_relative_offsets(self):
+        table = SeekTable(b"")
+        table.seekpoints = [
+            SeekPoint(0, 100, 4096),
+            SeekPoint(4096, 300, 4096),
+            SeekPoint(self.PLACEHOLDER, 0, 0)]
+        table.make_relative_offsets(100, 70)
+        self.failUnlessEqual(
+            table.seekpoints,
+            [SeekPoint(0, 0, 4096),
+             SeekPoint(4096, 200, 4096),
+             SeekPoint(self.PLACEHOLDER, 0, 0)])
+
+    def test_relative_shrink(self):
+        self.flac.save(padding=lambda x: 0)
+        # spec compliant offsets are not touched at all
+        self.failUnlessEqual(
+            list(FLAC(self.NEW).seektable.seekpoints),
+            self.original_points)
+        self._assert_seekpoints_point_at_frames()
+
+    def test_relative_grow(self):
+        self.flac.save(padding=lambda x: 99999)
+        self.failUnlessEqual(
+            list(FLAC(self.NEW).seektable.seekpoints),
+            self.original_points)
+        self._assert_seekpoints_point_at_frames()
+
+    def test_absolute_shrink(self):
+        self._make_absolute()
+        self.flac.save(padding=lambda x: 0)
+        self._assert_seekpoints_point_at_frames()
+
+    def test_absolute_grow(self):
+        self._make_absolute()
+        self.flac.save(padding=lambda x: 99999)
+        self._assert_seekpoints_point_at_frames()
+
+    def test_absolute_normalized_to_relative(self):
+        self._make_absolute()
+        self.flac.save(padding=lambda x: 0)
+        # once normalized, another save must not change the table anymore
+        points = list(FLAC(self.NEW).seektable.seekpoints)
+        FLAC(self.NEW).save(padding=lambda x: 42)
+        self.failUnlessEqual(
+            list(FLAC(self.NEW).seektable.seekpoints), points)
+
+    def test_absolute_shrink_seektable_at_each_position(self):
+        for position in range(1, len(self.flac.metadata_blocks)):
+            filename = get_temp_copy(self.SAMPLE)
+            try:
+                flac = FLAC(filename)
+                blocks = flac.metadata_blocks
+                seektable = flac.seektable
+                blocks.remove(seektable)
+                blocks.insert(min(max(position, 1), len(blocks)), seektable)
+                flac.save()
+
+                flac = FLAC(filename)
+                audio_offset = self._audio_offset(flac)
+                flac.seektable.seekpoints = [
+                    point if point.first_sample == self.PLACEHOLDER else
+                    SeekPoint(point.first_sample,
+                              audio_offset + point.byte_offset,
+                              point.num_samples)
+                    for point in flac.seektable.seekpoints]
+                current_padding = flac.metadata_blocks[-1].length
+                flac.save(padding=lambda x: current_padding)
+
+                flac = FLAC(filename)
+                flac.save(padding=lambda x: 0)
+                with open(filename, "rb") as h:
+                    data = h.read()
+                flac = FLAC(filename)
+                audio_offset = self._audio_offset(flac)
+                for point in flac.seektable.seekpoints:
+                    if point.first_sample == self.PLACEHOLDER:
+                        continue
+                    self.failUnless(self._is_frame_sync(
+                        data, audio_offset + point.byte_offset))
+            finally:
+                os.unlink(filename)
+
+    def test_relative_shrink_seektable_at_each_position(self):
+        for position in range(1, len(self.flac.metadata_blocks)):
+            filename = get_temp_copy(self.SAMPLE)
+            try:
+                flac = FLAC(filename)
+                blocks = flac.metadata_blocks
+                seektable = flac.seektable
+                blocks.remove(seektable)
+                blocks.insert(min(max(position, 1), len(blocks)), seektable)
+                flac.save(padding=lambda x: 0)
+                self.failUnlessEqual(
+                    list(FLAC(filename).seektable.seekpoints),
+                    self.original_points)
+                with open(filename, "rb") as h:
+                    data = h.read()
+                flac = FLAC(filename)
+                audio_offset = self._audio_offset(flac)
+                for point in flac.seektable.seekpoints:
+                    if point.first_sample == self.PLACEHOLDER:
+                        continue
+                    self.failUnless(self._is_frame_sync(
+                        data, audio_offset + point.byte_offset))
+            finally:
+                os.unlink(filename)
+
+    def test_default_padding_unchanged(self):
+        # the default padding behaviour must not modify the file
+        with open(self.SAMPLE, "rb") as h:
+            original = h.read()
+        self.flac.save()
+        with open(self.NEW, "rb") as h:
+            self.failUnlessEqual(h.read(), original)
 
 
 class TCueSheet(TestCase):
